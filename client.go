@@ -33,14 +33,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/gorilla/websocket"
 	"github.com/PuSuEngine/pusud/messages"
+	"github.com/gorilla/websocket"
 	"net/url"
+	"sync"
 	"time"
 )
 
-const debug = false
-const default_timeout = time.Second * 5
+const DEBUG = false
+const DEFAULT_TIMEOUT = time.Second * 5
 
 // Timeout exceeded when waiting to acknowledge Authorize/Subscribe request
 var ErrTimeoutExceeded = errors.New("Timeout exceeded when waiting for server to acknowledge message")
@@ -54,13 +55,16 @@ type subscribers map[string]SubscribeCallback
 // and call the Authorize(), Subscribe() and Publish()
 // methods to communicate with the PuSu network.
 type Client struct {
-	connection  *websocket.Conn
-	server      string
-	subscribers subscribers
-	Timeout     time.Duration
-	waiting     bool
-	waitingCh   chan string
-	connected   bool
+	connection   *websocket.Conn
+	server       string
+	subscribers  subscribers
+	Timeout      time.Duration
+	waiting      bool
+	waitingChs   []chan waitEvent
+	waiterMutex  sync.Mutex
+	connected    bool
+	onDisconnect func()
+	onError      func(string)
 }
 
 // Published message from the PuSu network. You get these
@@ -71,18 +75,27 @@ type Publish struct {
 	Content string `json:"content"`
 }
 
+type waitEvent struct {
+	Type    string
+	Channel string
+}
+
 // Claim you have authorization to access some things.
 // The server will determine what those things could be
 // based on the configured authenticator and the data you
 // give. Expect to get disconnected if this is invalid.
 func (pc *Client) Authorize(authorization string) error {
-	err := pc.sendMessage(&messages.Authorize{messages.TYPE_AUTHORIZE, authorization})
+	msg := messages.Authorize{
+		Type:          messages.TYPE_AUTHORIZE,
+		Authorization: authorization,
+	}
+	err := pc.sendMessage(&msg)
 
 	if err != nil {
 		return err
 	}
 
-	err = pc.wait(messages.TYPE_AUTHORIZATION_OK)
+	err = pc.wait(messages.TYPE_AUTHORIZATION_OK, "")
 
 	if err != nil {
 		return err
@@ -98,13 +111,17 @@ func (pc *Client) Authorize(authorization string) error {
 func (pc *Client) Subscribe(channel string, callback SubscribeCallback) error {
 	pc.subscribers[channel] = callback
 
-	err := pc.sendMessage(&messages.Subscribe{messages.TYPE_SUBSCRIBE, channel})
+	msg := messages.Subscribe{
+		Type:    messages.TYPE_SUBSCRIBE,
+		Channel: channel,
+	}
+	err := pc.sendMessage(&msg)
 
 	if err != nil {
 		return err
 	}
 
-	err = pc.wait(messages.TYPE_SUBSCRIBE_OK)
+	err = pc.wait(messages.TYPE_SUBSCRIBE_OK, channel)
 
 	if err != nil {
 		return err
@@ -116,19 +133,39 @@ func (pc *Client) Subscribe(channel string, callback SubscribeCallback) error {
 // Publish a message on the given channel
 func (pc *Client) Publish(channel string, content string) error {
 	// TODO: Support interface{} for content
-	return pc.sendMessage(&messages.Publish{messages.TYPE_PUBLISH, channel, content})
+	msg := messages.Publish{
+		Type:    messages.TYPE_PUBLISH,
+		Channel: channel,
+		Content: content,
+	}
+	return pc.sendMessage(&msg)
 }
 
 // Disconnect from the server
 func (pc *Client) Close() {
 	pc.connected = false
-	pc.connection.Close()
+	if pc.connection != nil {
+		pc.connection.Close()
+		pc.connection = nil
+	}
+}
+
+func (pc *Client) OnDisconnect(listener func()) {
+	pc.onDisconnect = listener
+}
+
+func (pc *Client) OnError(listener func(string)) {
+	pc.onError = listener
 }
 
 func (pc *Client) sendMessage(message messages.Message) (err error) {
+	if pc.connection == nil {
+		return
+	}
+
 	data := message.ToJson()
 
-	if debug {
+	if DEBUG {
 		fmt.Printf("-> %s\n", data)
 	}
 
@@ -139,21 +176,41 @@ func (pc *Client) sendMessage(message messages.Message) (err error) {
 
 func (pc *Client) disconnected() {
 	pc.connected = false
-	if debug {
+	if DEBUG {
 		fmt.Printf("Disconnected from server.\n")
+	}
+	if pc.onDisconnect != nil {
+		pc.onDisconnect()
+	}
+}
+
+func (pc *Client) error(errType string) {
+	if DEBUG {
+		fmt.Printf("Got error from server: %s.\n", errType)
+	}
+
+	if pc.onError != nil {
+		pc.onError(errType)
 	}
 }
 
 func (pc *Client) receive(data []byte) {
-	if debug {
+	if DEBUG {
 		fmt.Printf("<- %s\n", data)
 	}
 
 	m := messages.GenericMessage{}
 	json.Unmarshal(data, &m)
 
-	if pc.waiting {
-		pc.waitingCh <- m.Type
+	if len(pc.waitingChs) > 0 {
+		e := waitEvent{}
+		json.Unmarshal(data, &e)
+
+		pc.waiterMutex.Lock()
+		for _, ch := range pc.waitingChs {
+			ch <- e
+		}
+		pc.waiterMutex.Unlock()
 	}
 
 	if m.Type == messages.TYPE_PUBLISH {
@@ -165,25 +222,49 @@ func (pc *Client) receive(data []byte) {
 			callback(&p)
 		}
 	}
+
+	if m.Type == messages.TYPE_AUTHORIZATION_FAILED || m.Type == messages.TYPE_PERMISSION_DENIED || m.Type == messages.TYPE_UNKNOWN_MESSAGE_RECEIVED {
+		pc.error(m.Type)
+	}
 }
 
-func (pc *Client) wait(eventType string) (err error) {
-	pc.waiting = true
-	defer func() {
-		pc.waiting = false
-	}()
+func (pc *Client) addWaiter(ch chan waitEvent) {
+	pc.waiterMutex.Lock()
+	defer pc.waiterMutex.Unlock()
+	pc.waitingChs = append(pc.waitingChs, ch)
+}
 
-	if debug {
-		fmt.Printf("Waiting for %s\n", eventType)
+func (pc *Client) removeWaiter(ch chan waitEvent) {
+	pc.waiterMutex.Lock()
+	defer pc.waiterMutex.Unlock()
+
+	chs := []chan waitEvent{}
+	for _, c := range pc.waitingChs {
+		if c != ch {
+			chs = append(chs, c)
+		}
+	}
+	pc.waitingChs = chs
+}
+
+func (pc *Client) wait(eventType string, channel string) (err error) {
+	ch := make(chan waitEvent)
+	pc.addWaiter(ch)
+	defer pc.removeWaiter(ch)
+
+	if DEBUG {
+		if channel != "" {
+			fmt.Printf("Waiting for %s on %s\n", eventType, channel)
+		} else {
+			fmt.Printf("Waiting for %s\n", eventType)
+		}
 	}
 
 	select {
-	case t := <-pc.waitingCh:
-		// Since all the operations that wait are
-		// synchronous, we don't have to check channel.
-		if t == eventType {
-			if debug {
-				fmt.Printf("Got %s\n", t)
+	case e := <-ch:
+		if e.Type == eventType && e.Channel == channel {
+			if DEBUG {
+				fmt.Printf("Got %s for %s\n", e.Type, e.Channel)
 			}
 			return
 		}
@@ -198,7 +279,7 @@ func (pc *Client) wait(eventType string) (err error) {
 // Connect to the server
 func (pc *Client) Connect() (err error) {
 
-	if debug {
+	if DEBUG {
 		fmt.Printf("Connecting to %s\n", pc.server)
 	}
 
@@ -221,7 +302,7 @@ func (pc *Client) Connect() (err error) {
 		}
 	}()
 
-	err = pc.wait(messages.TYPE_HELLO)
+	err = pc.wait(messages.TYPE_HELLO, "")
 
 	if err != nil {
 		pc.connected = true
@@ -236,9 +317,9 @@ func NewClient(host string, port int) (pc *Client, err error) {
 	u := url.URL{Scheme: "ws", Host: addr, Path: "/"}
 
 	pc = &Client{}
-	pc.waitingCh = make(chan string)
+	pc.waitingChs = []chan waitEvent{}
 	pc.subscribers = subscribers{}
-	pc.Timeout = default_timeout
+	pc.Timeout = DEFAULT_TIMEOUT
 	pc.server = u.String()
 
 	err = pc.Connect()
