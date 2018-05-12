@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"time"
+	"os"
 )
 
 var received = 0
@@ -12,6 +13,8 @@ var received = 0
 func main() {
 	log.Printf("Connecting to 127.0.0.1:55000")
     pc, _ := gopusu.NewClient("127.0.0.1", 55000)
+	pc.OnDisconnect(onDisconnect)
+	pc.OnError(onError)
     defer pc.Close()
 	log.Printf("Authorizing with 'foo'")
     pc.Authorize("foo")
@@ -24,6 +27,15 @@ func main() {
 		time.Sleep(time.Second * 10)
 		log.Printf("Got %d messages", received)
 	}
+}
+
+func onDisconnect() {
+	log.Println("Disconnected from server. Quitting.")
+	os.Exit(0)
+}
+
+func onError(errType string) {
+	log.Printf("Got error %s\n", errType)
 }
 
 func listener(msg *gopusu.Publish) {
