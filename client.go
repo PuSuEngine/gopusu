@@ -260,20 +260,21 @@ func (pc *Client) wait(eventType string, channel string) (err error) {
 		}
 	}
 
-	select {
-	case e := <-ch:
-		if e.Type == eventType && e.Channel == channel {
-			if DEBUG {
-				fmt.Printf("Got %s for %s\n", e.Type, e.Channel)
+	timeout := time.After(pc.Timeout)
+	for {
+		select {
+		case e := <-ch:
+			if e.Type == eventType && e.Channel == channel {
+				if DEBUG {
+					fmt.Printf("Got %s for %s\n", e.Type, e.Channel)
+				}
+				return
 			}
+		case <-timeout:
+			err = ErrTimeoutExceeded
 			return
 		}
-	case <-time.After(pc.Timeout):
-		err = ErrTimeoutExceeded
-		return
 	}
-
-	return
 }
 
 // Connect to the server
