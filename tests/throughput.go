@@ -10,8 +10,9 @@ import (
 
 func main() {
 	delay := 10 * time.Millisecond
+	sleepInterval := 25
 	for {
-		log.Printf("Starting test with %dms delay\n", delay / time.Millisecond)
+		log.Printf("Starting test with %dms delay every %d messages\n", delay/time.Millisecond, sleepInterval)
 		time.Sleep(time.Second)
 		pc, err := gopusu.NewClient("127.0.0.1", 55000)
 		pc.OnDisconnect(onDisconnect)
@@ -41,7 +42,7 @@ func main() {
 				fmt.Print(".")
 			}
 			pc.Publish("channel.1", fmt.Sprintf("message %d", i))
-			if i%25 == 0 {
+			if i%sleepInterval == 0 {
 				time.Sleep(delay)
 			}
 		}
@@ -58,6 +59,8 @@ func main() {
 
 		if delay > time.Millisecond {
 			delay -= time.Millisecond
+		} else {
+			sleepInterval += 5
 		}
 	}
 }
