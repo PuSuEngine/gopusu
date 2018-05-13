@@ -12,7 +12,7 @@ func main() {
 	delay := 10 * time.Millisecond
 	sleepInterval := 25
 	for {
-		log.Printf("Starting test with %dms delay every %d messages\n", delay/time.Millisecond, sleepInterval)
+		log.Printf("Starting test with %s delay every %d messages\n", delay, sleepInterval)
 		time.Sleep(time.Second)
 		pc, err := gopusu.NewClient("127.0.0.1", 55000)
 		pc.OnDisconnect(onDisconnect)
@@ -49,12 +49,11 @@ func main() {
 		fmt.Print("\n")
 
 		since := time.Since(start)
-		msec := since / time.Millisecond
 		duration := since / time.Duration(messages)
 		rate := int64(time.Second / duration)
 
-		log.Printf("Sent %d messages in %d msec", messages, int64(msec))
-		log.Printf("%d usec/message", int64(duration/time.Microsecond))
+		log.Printf("Sent %d messages in %s", messages, since)
+		log.Printf("%s/message", duration)
 		log.Printf("%d messages/sec", rate)
 
 		if delay > time.Millisecond {
